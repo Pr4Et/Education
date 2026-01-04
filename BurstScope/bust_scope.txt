@@ -1,0 +1,20 @@
+Burst Scope for physical acoustic demonstations (geometric acoustics, time reversal mirror).
+Uses a loudspeaker as emitter and a microphone as detector.
+Designed by Shahar Seifer, Weizmann Insitute of Science, 2025
+license: CC-BY-4.0  (https://creativecommons.org/licenses/by/4.0/legalcode)
+
+ - Stage 1: estimates I/O latency using periodic bursts.
+ - Stage 2: synchronized plot, with controls:
+     r : stops bursts, records 5s interval, searches for a short and hight peak and extracts baseline (window centered at peak)
+     1 : plays baseline once, shows microphone response and stores in memory
+     2 : plays reversed baseline once, records and shows microphone response
+     3 : plays deconvolution signal (Baseline/Response in frequency domain), records and shows response
+     q : quits program
+
+
+Installation in Windows
+Install Python (3.10+ recommended).
+pip install sounddevice numpy matplotlib
+python burst_scope.py
+A dialog box will list your audio devices in a drop-down menu. Choose the preferred input and output devices (choose none for default).
+Tip: For best results, use a USB audio interface with a proper mic input (mono is fine) rather than the PC’s built in mic jack. Stereo isn’t required because this app overlays the ideal reference in software rather than looping back the speaker signal.

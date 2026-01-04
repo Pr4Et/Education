@@ -1,0 +1,10 @@
+Aruco tracker for Physics demonstrations
+Written by Shahar Seifer, Weizmann Institute of Science 2025
+License:  CC-BY-SA 4.0. (https://creativecommons.org/licenses/by/4.0/legalcode)
+
+Suitable for pendulum and other harmonic oscillations, study collisions, camera in a non-Newtonian (accelerating/ rotating) reference frame. 
+
+Use either live internal camera, or remote webcam camera (install IP Webcam app on your phone, start by clicking: start server),or use pre- recorded mp4 file.
+The program calculates position, rotation, two-axis size, and acceleration of Aruco tags (up to two tags on first come basis),and exports data to Excel file.
+To generate Aruco images: go to https://chev.me/arucogen/ and choose the 5X5 100 series with any valid ID. 
+Can track any number of tags, but keeps full track of 2. Exports data to Excel.
