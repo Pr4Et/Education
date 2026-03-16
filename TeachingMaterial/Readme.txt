@@ -1,0 +1,2 @@
+This Hebrew book covers the Physics of acoustics and ultrasound for teachers and talented students in K12 school and beyond.
+The book covers the essential background needed for experimentalist in the field of acoustics. 
