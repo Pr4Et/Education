@@ -1,16 +1,14 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # Burst Scope for physical acoustic demonstations
-# Uses a chosen loudspeaker as emitter and a chosen microphone as detector.
-# Designed by Shahar Seifer, Weizmann Insitute of Science, 2025
-# license: CC-BY-4.0  (https://creativecommons.org/licenses/by/4.0/legalcode)
+# Designed by Shahar Seifer, Weizmann Insitute of Science
 
 # - Stage 1: estimates I/O latency using periodic bursts.
 # - Stage 2: synchronized plot, with controls:
-#     r : stops bursts, records 5s interval, searches for a short and hight peak and extracts baseline (window centered at peak)
-#     1 : plays baseline once, shows microphone response and stores in memory
-#     2 : plays reversed baseline once, records and shows microphone response
-#     3 : plays deconvolution signal (Baseline/Response in frequency domain), records and shows response
-#     q : quits program
+#     r : stop bursts, clear plot, record 10 s, extract baseline (window centered at peak)
+#     1 : play baseline once, show microphone response and store in memory
+#     2 : play reversed baseline once, record and show microphone response
+#     3 : play deconvolution signal (Baseline/Response in frequency domain), record and show response
+#     q : quit program
 #
 
 import sys
@@ -33,32 +31,38 @@ except ImportError:
 # Configuration
 # -----------------------
 fs = 48000             # Sample rate (Hz)
-freq = 3000.0          # Burst sine frequency (Hz)
-cycles = 10            # Cycles per burst
+freq = 2000          # Burst sine frequency (Hz)
+cycles =10   # Cycles per burst
 period_ms = 1000.0     # Burst repetition period (ms)
-output_gain = 0.2      # Output amplitude (0..1)
+output_gain = 0.5      # Output amplitude (0..1)
 window_shape = 'none'  # 'none' or 'hann'
+plt.rcParams['keymap.save'] = []
 
 # Calibration (latency estimation)
-latency_search_ms = 250.0
+latency_search_ms = 400.0
 max_periods_back = 20
 ema_alpha = 0.2
 lock_std_ms = 2.0
 lock_min_estimates = 1
 min_corr_to_lock = 0.25
+freq_impulse=1000  #for air
+#freq_impulse=2000  #for board
+impulse_cycles=6.5
+
 
 # Operation (plot and demos)
 plot_window_ms = 40.0
-plot_window_ms_TRM= 600
+plot_window_ms_TRM= (impulse_cycles/freq_impulse)*1000*50
 record_seconds = 5.0
 refresh_interval_ms = int(period_ms)
 
-deconv_lowpass_cutoff_hz = 500.0   # or whatever you want
-deconv_lowpass_width_hz  = 100.0    # transition width for smooth roll-off
+deconv_lowpass_cutoff_hz = 300.0   # or whatever you want
 
 # Devices (None = defaults)
 output_device = None
 input_device = None  #use 1 for USB microphone when asked in the prompt
+externalsound_tf_pending = False
+externalsound_closeby_pending = False
 
 DEBUG = True
 
@@ -110,8 +114,12 @@ play_start_sample = None
 # Baseline / responses
 baseline_win = None
 response_win = None
-stored_response_abs = None  # absolute position of response from pressing '1'
-stored_response_win = None  # waveform of response captured after key '1'
+stored_speaker_response_abs = None  # absolute position of response from pressing 'r'
+stored_speaker_response_win = None  # waveform of response captured after key 'r'
+#stored_closeby_kick_response_abs = None  # absolute position of response from pressing 'r'
+stored_kick_response_win = None  # waveform of response captured after key 't'
+stored_closeby_kick_response_win = None  # waveform of response captured after key 't'
+impulse_synthetic=None
 
 # Global lock for shared state
 state_lock = threading.Lock()
@@ -326,10 +334,10 @@ def run_calibration():
 
 def run_operation():
     global mode, baseline_win, response_win, play_buffer, play_pos, play_start_sample
-    global stored_response_abs, stored_response_win
+    global stored_speaker_response_abs, stored_speaker_response_win,stored_kick_response_win, impulse_synthetic
 
     # High‑level operation state (independent from audio 'mode')
-    # op_state: 'burst', 'recording_baseline', 'playing_baseline',
+    # op_state: 'burst', 'recording_baseline', 'playing_baseline','recording_external'
     #           'playing_reverse', 'playing_deconv', 'frozen', 'idle'
     op_state = 'burst'
     pending_cmd = None          # 'record_baseline', 'play_baseline', 'play_reverse', 'play_deconv', 'idle'
@@ -348,10 +356,14 @@ def run_operation():
     tx_line, = ax_tx.plot(t, np.zeros_like(t), color='tab:blue')
     ax_tx.set_ylabel('Tx signal')
     ax_tx.set_title('Transmit signal')
-    ax_tx.set_ylim(-1.1 * output_gain, 1.1 * output_gain)
+    ax_tx.set_ylim(-1.1 , 1.1 )
+    ax_tx.xaxis.set_label_position('bottom')
+    ax_tx.tick_params(labelbottom=True)
 
     # --- Response plot (auto-scale) ---
     rx_line, = ax_rx.plot(t, np.zeros_like(t), color='tab:orange')
+    ax_rx.relim()  # recompute data bounds
+    ax_rx.autoscale(axis='y')  # autoscale ONLY the y‑axis
     ax_rx.set_ylabel('Rx signal')
     ax_rx.set_xlabel('Time (ms)')
     ax_rx.set_title('Microphone response')
@@ -388,7 +400,7 @@ def run_operation():
     def extract_and_freeze_baseline(start_abs, end_abs):
         """Cut 10 s recording to a baseline window centered at peak, freeze it."""
         nonlocal op_state, view_start_abs, tx_view, frozen_tx, frozen_rx
-        global baseline_win, response_win, stored_response_abs
+        global baseline_win, response_win, stored_speaker_response_abs
 
         rec = ring_read_abs(start_abs, end_abs - start_abs)
         i_max = int(np.argmax(np.abs(rec)))
@@ -403,7 +415,7 @@ def run_operation():
 
         # Store global baseline, clear old response info
         baseline_win = new_baseline.copy()
-        stored_response_abs = None
+        stored_speaker_response_abs = None
         response_win = None
 
         view_start_abs = start_win
@@ -413,7 +425,7 @@ def run_operation():
         frozen_rx = ring_read_abs(start_win, plot_window_samples)
         op_state = 'frozen'
 
-        plot_status('Baseline ready and frozen. Keys: 1=play baseline, 2=reversed, 3=deconv (uses response from 1), q=quit')
+        plot_status('Keys: 1=play impulse & record, 2=play reversed, 3=deconvolution, r=record external sound, 0=idle, q=quit')
 
     # --- Update loop ---
     def update():
@@ -425,7 +437,7 @@ def run_operation():
             traceback.print_exc()
             plt.close('all')
     def _update_core():
-        global mode, play_buffer, play_pos, play_start_sample, stored_response_win
+        global mode, play_buffer, play_pos, play_start_sample, baseline_win, stored_speaker_response_win, stored_kick_response_win, stored_closeby_kick_response_win, impulse_synthetic,externalsound_tf_pending,externalsound_closeby_pending
         nonlocal op_state, pending_cmd, last_play_kind
         nonlocal baseline_recording, baseline_start_abs
         nonlocal view_start_abs, tx_view
@@ -464,42 +476,72 @@ def run_operation():
                 op_state = 'idle'
                 frozen_tx[:] = 0
                 frozen_rx[:] = 0
-                plot_status('Idle. Press r to record baseline.')
-                # fall through to drawing
+                plot_status(' ')
 
             elif cmd == 'record_baseline':
-                # Start 10 s baseline recording
+                # Start 10 s baseline external sound recording
                 with state_lock:
                     mode = 'idle'  # stop bursts during baseline record
                     baseline_start_abs = sample_counter
                 baseline_recording = True
+                externalsound_tf_pending = True
                 op_state = 'recording_baseline'
-                plot_status(f'Recording baseline for {record_seconds:.1f} s...')
+                plot_status(f'Recording baseline external sound for {record_seconds:.1f} s...')
+
+            elif cmd == 'record_closeby':
+                # Start 10 s closeby external sound recording
+                with state_lock:
+                    mode = 'idle'  # stop bursts during baseline record
+                    baseline_start_abs = sample_counter
+                baseline_recording = True
+                externalsound_closeby_pending = True
+                op_state = 'recording_baseline'
+                plot_status(f'Recording closeby kick for {record_seconds:.1f} s...')
 
             elif cmd == 'play_baseline':
-                if baseline_win is None:
-                    plot_status('No baseline yet. Press r first.')
-                else:
-                    current_baseline = baseline_win.copy()
-                    with play_lock, state_lock:
-                        play_buffer = current_baseline
-                        play_pos = 0
-                        play_start_sample = sample_counter
-                        mode = 'play_once'
-                        lat = int(round(ema_latency)) if ema_latency is not None else 0
+                # Play a single positive half-cycle sine burst at frequency `freq`
+                n_impulse = int(round(impulse_cycles*fs / freq_impulse))
+                t_impulse = np.arange(n_impulse) / fs
 
-                    response_capture_abs = play_start_sample + lat
-                    view_start_abs = response_capture_abs
-                    tx_view = current_baseline.copy()
-                    op_state = 'playing_baseline'
-                    last_play_kind = 'baseline'
-                    plot_status('Baseline playing... response will freeze automatically.')
+                # Positive half-cycle
+                impulse = np.sin(2 * np.pi * freq_impulse * t_impulse).astype(np.float32)
+
+                # Scale safely
+                impulse *= 0.9 / (np.max(np.abs(impulse)) + 1e-9)
+
+                with play_lock, state_lock:
+                    play_buffer = np.zeros(plot_window_samples, dtype=np.float32)
+                    center = plot_window_samples // 2
+                    start = center
+                    play_buffer[start:start + len(impulse)] = impulse
+                    impulse_synthetic=play_buffer.copy()
+                    play_pos = 0
+                    play_start_sample = sample_counter
+                    mode = 'play_once'
+                    lat = int(round(ema_latency)) if ema_latency is not None else 0
+
+                response_capture_abs = play_start_sample + lat
+                view_start_abs = response_capture_abs
+
+                # Pad for display (so plots don’t resize)
+                tx_view = np.zeros(plot_window_samples, dtype=np.float32)
+                center = plot_window_samples // 2
+                start = center - len(impulse) // 2
+                tx_view[start:start + len(impulse)] = impulse
+
+                op_state = 'playing_baseline'
+                last_play_kind = 'baseline'
+                #plot_status('Playing impulse and recording response...')
 
             elif cmd == 'play_reverse':
                 if baseline_win is None:
-                    plot_status('No baseline yet. Press r first.')
+                    plot_status('No baseline yet. Press 1 or r first.')
                 else:
                     current_baseline = baseline_win.copy()
+                    peak = np.max(np.abs(current_baseline))
+                    if peak > 0:
+                        current_baseline = 0.9*current_baseline / peak
+
                     rev = current_baseline[::-1].copy()
                     with play_lock, state_lock:
                         play_buffer = rev
@@ -513,70 +555,73 @@ def run_operation():
                     tx_view = rev.copy()
                     op_state = 'playing_reverse'
                     last_play_kind = 'reverse'
-                    plot_status('Reversed baseline playing... response will freeze automatically.')
-
-            elif cmd == 'play_deconv':
+                    #plot_status('Reversed baseline playing... response will freeze automatically.')
+            elif cmd == 'play_direct':
                 if baseline_win is None:
-                    plot_status('No baseline yet. Press r first.')
-                elif stored_response_win is None:
-                    plot_status('No stored response from key 1. Press 1 first.')
+                    plot_status('No baseline yet. Press 1 or r first.')
                 else:
                     current_baseline = baseline_win.copy()
-                    response_once = stored_response_win.copy()
+                    peak = np.max(np.abs(current_baseline))
+                    if peak > 0:
+                        current_baseline = 0.9*current_baseline / peak
 
-                    flag_need_centering=False
-                    # Center response window on its peak
-                    if flag_need_centering:
-                        i_max = int(np.argmax(np.abs(response_once)))
-                        start = i_max - plot_window_samples // 2
-                        start = max(0, start)
-                        end = start + plot_window_samples
-                        if end > len(response_once):
-                            end = len(response_once)
-                            start = end - plot_window_samples
-                        response_centered = response_once[start:end]
-                    else:
-                        response_centered = response_once
+
+                    with play_lock, state_lock:
+                        play_buffer = current_baseline.copy()
+                        play_pos = 0
+                        play_start_sample = sample_counter
+                        mode = 'play_once'
+                        lat = int(round(ema_latency)) if ema_latency is not None else 0
+
+                    response_capture_abs = play_start_sample + lat
+                    view_start_abs = response_capture_abs
+                    tx_view = current_baseline.copy()
+                    op_state = 'playing_direct'
+                    last_play_kind = 'direct'
+                    #plot_status('Reversed baseline playing... response will freeze automatically.')
+
+            elif cmd == 'play_deconv':
+                if stored_speaker_response_win is None and (stored_kick_response_win is None or stored_closeby_kick_response_win is None):
+                    plot_status('No stored speaker kick response from key 1. Press 1 first.')
+                else:
+                    #current_baseline = baseline_win.copy()
                     # --- Remove DC offset from both signals ---
-                    current_baseline = current_baseline - np.mean(current_baseline)
+                    #current_baseline = current_baseline - np.mean(current_baseline)
+                    response_centered = stored_speaker_response_win.copy()
                     response_centered = response_centered - np.mean(response_centered)
 
                     N = plot_window_samples
-                    B = np.fft.rfft(current_baseline, n=N)
-                    R = np.fft.rfft(response_centered, n=N)
-                    eps = 1e-8 * np.max(np.abs(R))
-                    H = B / (R + eps)
+                    #B = np.fft.rfft(current_baseline, n=N)
 
-                    flag_need_low_pass_filtering=False
-                    # --- Low-pass filtering of H in frequency domain ---
-                    if flag_need_low_pass_filtering:
-                        freqs = np.fft.rfftfreq(N, d=1.0 / fs)
-                        fc = deconv_lowpass_cutoff_hz
-                        fw = deconv_lowpass_width_hz
-                        # Smooth mask: 1 below (fc - fw), 0 above (fc + fw), raised-cosine in between
-                        mask = np.ones_like(freqs, dtype=np.float32)
-                        if fw > 0:
-                            # transition band logical indices
-                            lo = fc - fw
-                            hi = fc + fw
-                            # below lo = 1, above hi = 0
-                            mask[freqs >= hi] = 0.0
-                            # smooth transition in [lo, hi]
-                            trans = (freqs >= lo) & (freqs < hi)
-                            x = (freqs[trans] - lo) / (hi - lo)  # 0..1
-                            mask[trans] = 0.5 * (1.0 + np.cos(np.pi * x))  # raised cosine from 1 to 0
-                        else:
-                            mask[freqs > fc] = 0.0
-                        H_filtered = H * mask
+                    # --- Step 1: estimate system TF ---
+                    if stored_kick_response_win is None or stored_closeby_kick_response_win is None:
+                        R = np.fft.rfft(response_centered, n=N)
+                        impulse_synthetic_centered=impulse_synthetic.copy()
+                        impulse_synthetic_centered=impulse_synthetic_centered-np.mean(impulse_synthetic_centered)
+                        T=np.fft.rfft(impulse_synthetic, n=N)
+                        eps_h = 1e-8 * np.max(np.abs(T))
+                        H_sys = R * np.conj(T) / (np.abs(T) ** 2 + eps_h)
                     else:
-                        H_filtered = H
+                        kick_response_centered = stored_kick_response_win.copy()
+                        kick_response_centered = kick_response_centered - np.mean(kick_response_centered)
+                        K_far = np.fft.rfft(kick_response_centered, n=N)
+                        closeby_kick_response_centered = stored_closeby_kick_response_win.copy()
+                        closeby_kick_response_centered=closeby_kick_response_centered-np.mean(closeby_kick_response_centered)
+                        K_near = np.fft.rfft(closeby_kick_response_centered, n=N)
+                        eps_h = 1e-8 * np.max(np.abs(K_near))
+                        H_sys = K_far * np.conj(K_near) / (np.abs(K_near) ** 2 + eps_h)
 
-                    h = np.fft.irfft(H_filtered, n=N).astype(np.float32)
-                    # Shift so the peak appears in the center
-                    h_centered = np.fft.fftshift(h)
+                    # --- Step 2: pre-distortion filter ---
+                    eps_tx = 1e-8 * np.max(np.abs(H_sys))
+                    H_tx =  np.conj(H_sys) / (np.abs(H_sys) ** 2 + eps_tx)
+                    tx_temp = np.fft.irfft(H_tx, n=N).astype(np.float32)
 
-                    m = np.max(np.abs(h_centered)) + 1e-9
-                    tx = (output_gain / m) * h_centered
+                   # Shift so the peak appears in the centre
+                    tx_centered = np.fft.fftshift(tx_temp)
+
+                    # Normalise for playback
+                    m = np.max(np.abs(tx_centered)) + 1e-9
+                    tx = 0.9*(output_gain / m) * tx_centered
 
                     with play_lock, state_lock:
                         play_buffer = tx
@@ -605,20 +650,43 @@ def run_operation():
         # -------------------------------------------------
         # 3) Playback completion → capture response & freeze
         # -------------------------------------------------
-        if op_state in ('playing_baseline', 'playing_reverse', 'playing_deconv'):
+        if op_state in ('playing_baseline', 'playing_reverse', 'playing_direct','playing_deconv'):
             if (local_mode == 'idle'
                     and response_capture_abs is not None
                     and local_sample_counter >= response_capture_abs + plot_window_samples):
 
-                mic = ring_read_abs(response_capture_abs, plot_window_samples)
+                #Read from microphone buffer and center the high oscillations peak
+                N = plot_window_samples
+                raw_len = 2 * N
+                mic_big = ring_read_abs(response_capture_abs, raw_len)
+                # Compute moving STD metric on mic_big (valid length raw_len-w+1)
+                w = int(round(impulse_cycles * fs / freq_impulse))
+                w = max(3, min(w, N // 2))
+                kernel = np.ones(w, dtype=np.float32)
+                mean = np.convolve(mic_big, kernel, mode='valid') / w
+                mean_sq = np.convolve(mic_big * mic_big, kernel, mode='valid') / w
+                var = np.maximum(mean_sq - mean * mean, 0.0)
+                std = np.sqrt(var)
+                i_center = int(np.argmax(std))# + w // 2  # index into mic_big
+                start = i_center - N // 2
+                start = max(0, min(start, raw_len - N))  # clamp safely
+                mic_centered = mic_big[start:start + N].copy()
+                # freeze copies
+                frozen_rx = mic_centered
                 frozen_tx = tx_view.copy()
-                frozen_rx = mic.copy()
                 op_state = 'frozen'
 
                 if last_play_kind == 'baseline':
-                    stored_response_win = mic.copy()
+                    stored_speaker_response_win = mic_centered.copy()
+                    baseline_win = mic_centered.copy()
+                if externalsound_tf_pending:
+                    stored_kick_response_win = mic_centered.copy()
+                    externalsound_tf_pending = False
+                if externalsound_closeby_pending:
+                    stored_closeby_kick_response_win = mic_centered.copy()
+                    externalsound_closeby_pending = False
 
-                plot_status('Playback finished. Response captured and frozen.')
+                #plot_status('Playback finished. Response captured and frozen.')
         # -------------------------------------------------
         # 4) Drawing, depending on op_state
         # -------------------------------------------------
@@ -637,7 +705,7 @@ def run_operation():
                 mic = np.zeros(plot_window_samples, dtype=np.float32)
             ideal = np.zeros(plot_window_samples, dtype=np.float32)
 
-        elif op_state in ('playing_baseline', 'playing_reverse', 'playing_deconv'):
+        elif op_state in ('playing_baseline', 'playing_reverse','playing_direct', 'playing_deconv'):
             # Show live response while playing
             if response_capture_abs is not None:
                 mic = ring_read_abs(response_capture_abs, plot_window_samples)
@@ -674,7 +742,7 @@ def run_operation():
     # --- Key handler: only sets commands / simple state ---
     def on_key(event):
         nonlocal pending_cmd, op_state
-        global mode, play_buffer, play_pos, play_start_sample, stored_response_abs, stored_response_win
+        global mode, play_buffer, play_pos, play_start_sample, stored_speaker_response_abs, stored_speaker_response_win
         global plot_window_ms, plot_window_samples
         if not event.key:
             return
@@ -684,18 +752,23 @@ def run_operation():
             plt.close(fig)
             return
 
+        if k =='0' or k=='r' or k=='c' or k=='1':
+            plot_window_ms = plot_window_ms_TRM
+            plot_window_samples = int(round(fs * plot_window_ms / 1000.0))
+
         if k == '0':
             pending_cmd = 'idle'
             return
 
         if k == 'r':
-            plot_window_ms = plot_window_ms_TRM
-            plot_window_samples = int(round(fs * plot_window_ms / 1000.0))
             pending_cmd = 'record_baseline'
+            return
+        if k == 'c':
+            pending_cmd = 'record_closeby'
             return
 
         if k == '1':
-            pending_cmd = 'play_baseline'
+            pending_cmd = 'play_baseline' # records the sound of impulse from the loudspeaker
             return
 
         if k == '2':
@@ -705,12 +778,15 @@ def run_operation():
         if k == '3':
             pending_cmd = 'play_deconv'
             return
+        if k == '4':
+            pending_cmd = 'play_direct'
+            return
 
     fig.canvas.mpl_connect('key_press_event', on_key)
 
     # Start in burst mode visually; audio 'mode' is already 'burst' globally
     op_state = 'burst'
-    plot_status('Burst mode. Press r to record baseline, 1/2/3 to play, q to quit.')
+    plot_status('Burst mode')
 
     plt.show()
 
